@@ -1,0 +1,436 @@
+#!/usr/bin/env bash
+# Launch the configured startup apps and place each one on the requested
+# workspace, monitor or special workspace, once per Hyprland session.
+#
+# Run with --dry-run to print the resolved plan without launching or moving
+# anything. Run with --force to re-apply the layout in the current session;
+# apps that already have a window are moved, not launched again.
+
+set -uo pipefail
+
+PLUGIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+CONFIG=${WORKSPACE_LAUNCHER_CONFIG:-$PLUGIN_DIR/layout.json}
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/omarchy
+SESSION_FILE=$STATE_DIR/workspace-launcher.session
+LOG_FILE=$STATE_DIR/workspace-launcher.log
+
+FORCE=0
+DRY_RUN=0
+
+for arg in "$@"; do
+  case "$arg" in
+    --force) FORCE=1 ;;
+    --dry-run) DRY_RUN=1 ;;
+    *)
+      printf 'workspace-launcher: unknown argument: %s\n' "$arg" >&2
+      exit 2
+      ;;
+  esac
+done
+
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+
+LOCK_FILE=$STATE_DIR/workspace-launcher.lock
+exec 9>"$LOCK_FILE" 2>/dev/null || true
+if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
+  printf '{"status":"busy","reason":"another apply is already running"}\n'
+  exit 0
+fi
+
+if [[ -f $LOG_FILE ]]; then
+  size=$(stat -c %s "$LOG_FILE" 2>/dev/null || printf '0')
+  if [[ $size =~ ^[0-9]+$ ]] && (( size > 131072 )); then
+    mv -f "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null || true
+  fi
+fi
+
+log() {
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG_FILE" 2>/dev/null || true
+}
+
+json_error() {
+  local message=$1
+  if command -v jq >/dev/null 2>&1; then
+    jq -cn --arg message "$message" '{status:"error", message:$message}'
+  else
+    printf '{"status":"error","message":"%s"}\n' "$message"
+  fi
+}
+
+fail() {
+  log "error: $*"
+  json_error "$*"
+  exit 1
+}
+
+command -v hyprctl >/dev/null 2>&1 || fail "hyprctl is not on PATH"
+command -v jq >/dev/null 2>&1 || fail "jq is not on PATH"
+
+# Wait for the compositor to answer before doing anything. At login the shell
+# can start before Hyprland has finished reading its configuration.
+ready=0
+for _ in $(seq 1 60); do
+  if timeout 2 hyprctl monitors -j >/dev/null 2>&1; then
+    ready=1
+    break
+  fi
+  sleep 0.5
+done
+(( ready )) || fail "Hyprland did not become reachable"
+
+session=${HYPRLAND_INSTANCE_SIGNATURE:-}
+if [[ -z $session ]]; then
+  session=$(hyprctl instances -j 2>/dev/null \
+    | jq -r 'if type == "array" then (.[0].instance // "") else (.instance // "") end' 2>/dev/null)
+fi
+[[ -n $session ]] || session="unknown"
+
+# A shell restart reloads this service. The marker keeps that from launching a
+# second copy of every app.
+if (( ! FORCE && ! DRY_RUN )) && [[ -f $SESSION_FILE ]] && [[ $(<"$SESSION_FILE") == "$session" ]]; then
+  printf '{"status":"skipped","reason":"already applied for this Hyprland session"}\n'
+  exit 0
+fi
+
+[[ -f $CONFIG ]] || fail "layout config not found: $CONFIG"
+jq -e . "$CONFIG" >/dev/null 2>&1 || fail "layout config is not valid JSON: $CONFIG"
+jq -e '(.apps | type) == "array"' "$CONFIG" >/dev/null 2>&1 || fail "layout config needs an apps array"
+
+apps=$(jq -c '.apps // []' "$CONFIG")
+count=$(jq 'length' <<<"$apps" 2>/dev/null)
+[[ $count =~ ^[0-9]+$ ]] || fail "layout config has no apps array"
+(( count >= 1 )) || fail "layout config lists no apps"
+(( count <= 32 )) || fail "layout config lists more than 32 apps"
+
+settle=$(jq -r '.settleSeconds // 25' "$CONFIG" 2>/dev/null)
+[[ $settle =~ ^[0-9]+$ ]] || settle=25
+(( settle >= 2 && settle <= 120 )) || settle=25
+
+monitors=$(hyprctl monitors -j) || fail "could not read monitors"
+[[ $(jq 'length' <<<"$monitors") -gt 0 ]] || fail "no monitors connected"
+
+rule_names=()
+app_names=()
+class_res=()
+title_res=()
+target_ws=()
+target_mon=()
+target_slot=()
+target_special=()
+skipped_json='[]'
+plan_json='[]'
+launched_count=0
+moved_count=0
+declare -A seen_match=()
+
+cleanup_rules() {
+  local rule
+  for rule in "${rule_names[@]}"; do
+    [[ -n $rule ]] && hyprctl eval "hl.window_rule({ name = \"$rule\", enabled = false })" >/dev/null 2>&1
+  done
+}
+
+if (( ! DRY_RUN )); then
+  trap cleanup_rules EXIT
+fi
+
+lua_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n\r\t' '   '
+}
+
+one_line() {
+  printf '%s' "$1" | tr '\n\r' '  '
+}
+
+matching_addresses() {
+  local class=$1
+  local title=$2
+  local clients=$3
+  jq -r --arg re "$class" --arg tre "$title" '
+    .[]
+    | select((.class // "") | test($re))
+    | select($tre == "" or ((.title // "") | test($tre)))
+    | .address
+  ' <<<"$clients" 2>/dev/null
+}
+
+resolve_monitor() {
+  local requested=$1
+  local lower=${requested,,}
+  case "$lower" in
+    primary|main|first)
+      jq -r 'sort_by(.id) | .[0].name // ""' <<<"$monitors"
+      ;;
+    secondary|second)
+      jq -r 'sort_by(.id) | .[1].name // ""' <<<"$monitors"
+      ;;
+    *)
+      jq -r --arg m "$requested" 'map(select(.name == $m)) | .[0].name // ""' <<<"$monitors"
+      ;;
+  esac
+}
+
+workspace_block() {
+  local monitor=$1
+  local block=""
+
+  if [[ -f $STATE_DIR/monitor-workspaces ]]; then
+    block=$(awk -F'\t' -v mon="$monitor" '
+      $2 == mon && $1 ~ /^[0-9]+$/ { print $1; exit }
+    ' "$STATE_DIR/monitor-workspaces")
+  fi
+
+  if [[ -z $block ]]; then
+    # Fall back to the workspace the monitor is showing: Omarchy gives each
+    # monitor a block of ten, so its active workspace names the block.
+    block=$(jq -r --arg m "$monitor" '
+      .[]
+      | select(.name == $m)
+      | (.activeWorkspace.id // 1)
+      | if . < 1 then 1 else . end
+      | ((. - 1) / 10 | floor)
+    ' <<<"$monitors" 2>/dev/null | head -1)
+  fi
+
+  printf '%s' "$block"
+}
+
+index=0
+while IFS= read -r app; do
+  index=$((index + 1))
+
+  jq -e '
+    (.name | type == "string" and length >= 1 and length <= 60) and
+    (
+      (.workspace | type == "number" and . >= 1 and . <= 10 and ((. | floor) == .))
+      or
+      (.workspace | type == "string" and test("^[A-Za-z0-9._-]{1,40}$"))
+    ) and
+    (
+      if (.workspace | type) == "number" then
+        (.monitor | type == "string" and length >= 1 and length <= 40)
+      else
+        ((.monitor // "") | type == "string" and length <= 40)
+      end
+    ) and
+    (.command | type == "string" and length >= 1 and length <= 1000) and
+    (.class | type == "string" and length >= 1 and length <= 300) and
+    ((.title // "") | type == "string" and length <= 300)
+  ' <<<"$app" >/dev/null 2>&1 \
+    || fail "app entry $index needs name, workspace (1-10 or a special name), command and class; numeric workspaces also need a monitor"
+
+  name=$(jq -r '.name' <<<"$app" | tr -d '\r\n')
+  workspace_value=$(jq -r '.workspace' <<<"$app")
+  requested_monitor=$(jq -r '.monitor // ""' <<<"$app" | tr -d '\r\n')
+  command=$(jq -r '.command' <<<"$app")
+  command_log=$(one_line "$command")
+  class=$(jq -r '.class' <<<"$app")
+  title=$(jq -r '.title // ""' <<<"$app")
+
+  jq -n --arg re "$class" '"" | test($re)' >/dev/null 2>&1 \
+    || fail "$name has an invalid class regex"
+  if [[ -n $title ]]; then
+    jq -n --arg re "$title" '"" | test($re)' >/dev/null 2>&1 \
+      || fail "$name has an invalid title regex"
+  fi
+
+  match_key="$class"$'\x1f'"$title"
+  if [[ -n ${seen_match[$match_key]:-} ]]; then
+    fail "$name repeats another entry's class/title match; give each app one target"
+  fi
+  seen_match[$match_key]=1
+
+  monitor=""
+  selector=""
+  label=""
+  slot=""
+  special=""
+  wsid=""
+  is_special=0
+
+  if [[ $workspace_value =~ ^[0-9]+$ ]]; then
+    slot=$workspace_value
+    monitor=$(resolve_monitor "$requested_monitor")
+    if [[ -z $monitor ]]; then
+      log "skipping $name: monitor '$requested_monitor' is not connected"
+      skipped_json=$(jq -cn --argjson list "$skipped_json" --arg name "$name" '$list + [$name]')
+      continue
+    fi
+
+    block=$(workspace_block "$monitor")
+    if [[ ! $block =~ ^[0-9]+$ ]]; then
+      log "skipping $name: could not resolve a workspace block for $monitor"
+      skipped_json=$(jq -cn --argjson list "$skipped_json" --arg name "$name" '$list + [$name]')
+      continue
+    fi
+
+    wsid=$((block * 10 + slot))
+    selector=$wsid
+    label="$monitor workspace $slot (Hyprland $wsid)"
+  else
+    is_special=1
+    special=$workspace_value
+    selector="special:$special"
+    label="special workspace $special"
+  fi
+
+  if (( DRY_RUN )); then
+    if (( is_special )); then
+      plan_json=$(jq -cn \
+        --argjson list "$plan_json" \
+        --arg name "$name" \
+        --arg workspace "$special" \
+        --arg command "$command" \
+        '$list + [{name:$name, workspace:$workspace, special:true, command:$command}]')
+    else
+      plan_json=$(jq -cn \
+        --argjson list "$plan_json" \
+        --arg name "$name" \
+        --arg monitor "$monitor" \
+        --argjson slot "$slot" \
+        --argjson workspaceId "$wsid" \
+        --arg command "$command" \
+        '$list + [{name:$name, monitor:$monitor, workspace:$slot, workspaceId:$workspaceId, command:$command}]')
+    fi
+    log "plan: $name -> $label"
+    continue
+  fi
+
+  app_names+=("$name")
+  class_res+=("$class")
+  title_res+=("$title")
+  target_ws+=("$selector")
+  target_mon+=("$monitor")
+  target_slot+=("$label")
+  target_special+=("$is_special")
+
+  # A temporary rule places the first window on the target workspace without
+  # switching the user's view. It is disabled when the settle loop ends, so
+  # the app is not pinned there for the rest of the session.
+  rule="workspace-launcher-$index"
+  match="class = \"$(lua_escape "$class")\""
+  [[ -n $title ]] && match="$match, title = \"$(lua_escape "$title")\""
+  if hyprctl eval "hl.window_rule({ name = \"$rule\", enabled = true, match = { $match }, workspace = \"$selector silent\" })" >/dev/null 2>&1; then
+    rule_names+=("$rule")
+  else
+    log "warning: could not add a window rule for $name"
+    rule_names+=("")
+  fi
+
+  clients=$(hyprctl clients -j 2>/dev/null) || clients='[]'
+  if [[ -n $(matching_addresses "$class" "$title" "$clients") ]]; then
+    log "$name already has a window; not launching a second copy"
+  elif setsid --fork sh -c "$command" >/dev/null 2>&1 </dev/null; then
+    launched_count=$((launched_count + 1))
+    log "launched $name -> $label"
+  else
+    log "warning: could not launch $name: $command_log"
+  fi
+done < <(jq -c '.[]' <<<"$apps")
+
+if (( DRY_RUN )); then
+  jq -cn --argjson plan "$plan_json" --argjson skipped "$skipped_json" \
+    '{status:"dry-run", plan:$plan, skipped:$skipped}'
+  exit 0
+fi
+
+# Record the session before the settle loop: a shell reload during a slow app
+# start must not launch everything a second time.
+printf '%s\n' "$session" >"$SESSION_FILE" 2>/dev/null || log "warning: could not write the session marker"
+
+# Give newly launched apps time to map their windows, moving each as it
+# appears. Stop early once every app has a window and nothing new has arrived
+# for two seconds.
+deadline=$((SECONDS + settle))
+complete_since=-1
+while (( SECONDS < deadline )); do
+  clients=$(hyprctl clients -j 2>/dev/null) || clients='[]'
+  all_have=1
+  changed=0
+
+  for i in "${!target_ws[@]}"; do
+    selector=${target_ws[$i]}
+    addresses=$(matching_addresses "${class_res[$i]}" "${title_res[$i]}" "$clients")
+
+    if [[ -z $addresses ]]; then
+      all_have=0
+      continue
+    fi
+
+    while IFS= read -r address; do
+      [[ -z $address ]] && continue
+      if (( target_special[i] )); then
+        current=$(jq -r --arg address "$address" '
+          .[] | select(.address == $address) | .workspace.name
+        ' <<<"$clients" 2>/dev/null | head -1)
+      else
+        current=$(jq -r --arg address "$address" '
+          .[] | select(.address == $address) | .workspace.id
+        ' <<<"$clients" 2>/dev/null | head -1)
+      fi
+      [[ $current == "$selector" ]] && continue
+
+      if hyprctl dispatch "hl.dsp.window.move({ workspace = \"$selector\", follow = false, window = \"address:$address\" })" >/dev/null 2>&1; then
+        moved_count=$((moved_count + 1))
+        changed=1
+        log "moved ${app_names[$i]} to ${target_slot[$i]}"
+      fi
+    done <<<"$addresses"
+  done
+
+  if (( all_have )); then
+    (( complete_since < 0 )) && complete_since=$SECONDS
+    (( changed )) && complete_since=$SECONDS
+    (( SECONDS - complete_since >= 2 )) && break
+  else
+    complete_since=-1
+  fi
+  sleep 0.5
+done
+
+# If a target workspace was created on whichever monitor had focus, bring it
+# home to the monitor named in the config.
+workspaces=$(hyprctl workspaces -j 2>/dev/null) || workspaces='[]'
+declare -A placed=()
+for i in "${!target_ws[@]}"; do
+  (( target_special[i] )) && continue
+  wsid=${target_ws[$i]}
+  monitor=${target_mon[$i]}
+  [[ -n ${placed[$wsid]:-} ]] && continue
+  placed[$wsid]=1
+
+  current=$(jq -r --argjson id "$wsid" '
+    .[] | select(.id == $id) | .monitor
+  ' <<<"$workspaces" 2>/dev/null | head -1)
+  if [[ -n $current && $current != "$monitor" ]]; then
+    if hyprctl dispatch "hl.dsp.workspace.move({ workspace = \"$wsid\", monitor = \"$monitor\" })" >/dev/null 2>&1; then
+      log "moved workspace $wsid to $monitor"
+    else
+      log "warning: could not move workspace $wsid to $monitor"
+    fi
+  fi
+done
+
+clients=$(hyprctl clients -j 2>/dev/null) || clients='[]'
+missing=0
+for i in "${!target_ws[@]}"; do
+  if [[ -z $(matching_addresses "${class_res[$i]}" "${title_res[$i]}" "$clients") ]]; then
+    missing=$((missing + 1))
+    log "warning: no window appeared for ${app_names[$i]}"
+  fi
+done
+
+cleanup_rules
+printf '%s\n' "$session" >"$SESSION_FILE" 2>/dev/null || true
+
+status=ok
+(( missing > 0 )) && status=partial
+
+jq -cn \
+  --arg status "$status" \
+  --arg session "$session" \
+  --argjson launched "$launched_count" \
+  --argjson moved "$moved_count" \
+  --argjson notFound "$missing" \
+  --argjson skipped "$skipped_json" \
+  '{status:$status, session:$session, launched:$launched, moved:$moved, notFound:$notFound, skipped:$skipped}'

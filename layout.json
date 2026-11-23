@@ -1,0 +1,74 @@
+{
+  "settleSeconds": 30,
+  "apps": [
+    {
+      "name": "Chrome",
+      "monitor": "DP-1",
+      "workspace": 1,
+      "command": "omarchy-launch-browser",
+      "class": "^(google-chrome)$"
+    },
+    {
+      "name": "Chromium",
+      "monitor": "DP-1",
+      "workspace": 9,
+      "command": "uwsm-app -- chromium",
+      "class": "^(chromium)$"
+    },
+    {
+      "name": "Google Messages",
+      "monitor": "DP-1",
+      "workspace": 4,
+      "command": "omarchy-launch-webapp https://messages.google.com/web/conversations",
+      "class": "^chrome-messages\\.google\\.com.*$"
+    },
+    {
+      "name": "WhatsApp",
+      "monitor": "DP-1",
+      "workspace": 4,
+      "command": "omarchy-launch-webapp https://web.whatsapp.com/",
+      "class": "^chrome-web\\.whatsapp\\.com.*$"
+    },
+    {
+      "name": "Discord",
+      "monitor": "DP-1",
+      "workspace": 5,
+      "command": "omarchy-launch-webapp https://discord.com/channels/@me",
+      "class": "^chrome-discord\\.com.*$"
+    },
+    {
+      "name": "Ghostty",
+      "workspace": "scratchpad",
+      "command": "uwsm-app -- ghostty",
+      "class": "^(com\\.mitchellh\\.ghostty)$"
+    },
+    {
+      "name": "Files",
+      "monitor": "DP-2",
+      "workspace": 1,
+      "command": "omarchy-launch-nautilus",
+      "class": "^(org\\.gnome\\.Nautilus)$"
+    },
+    {
+      "name": "Notion",
+      "monitor": "DP-2",
+      "workspace": 5,
+      "command": "uwsm-app -- notion-desktop",
+      "class": "^(notion)$"
+    },
+    {
+      "name": "VS Code",
+      "monitor": "DP-2",
+      "workspace": 9,
+      "command": "uwsm-app -- code",
+      "class": "^(com\\.microsoft\\.VSCode)$"
+    },
+    {
+      "name": "T3 Code",
+      "monitor": "DP-2",
+      "workspace": 10,
+      "command": "uwsm-app -- /home/blake/.local/share/t3code/T3-Code.AppImage",
+      "class": "^(t3code|com\\.t3tools\\.T3Code)$"
+    }
+  ]
+}
