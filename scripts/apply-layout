@@ -13,6 +13,7 @@ CONFIG=${WORKSPACE_LAUNCHER_CONFIG:-$PLUGIN_DIR/layout.json}
 STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/omarchy
 SESSION_FILE=$STATE_DIR/workspace-launcher.session
 LOG_FILE=$STATE_DIR/workspace-launcher.log
+RESULT_FILE=$STATE_DIR/workspace-launcher.result
 
 FORCE=0
 DRY_RUN=0
@@ -30,13 +31,6 @@ done
 
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 
-LOCK_FILE=$STATE_DIR/workspace-launcher.lock
-exec 9>"$LOCK_FILE" 2>/dev/null || true
-if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
-  printf '{"status":"busy","reason":"another apply is already running"}\n'
-  exit 0
-fi
-
 if [[ -f $LOG_FILE ]]; then
   size=$(stat -c %s "$LOG_FILE" 2>/dev/null || printf '0')
   if [[ $size =~ ^[0-9]+$ ]] && (( size > 131072 )); then
@@ -46,6 +40,20 @@ fi
 
 log() {
   printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG_FILE" 2>/dev/null || true
+}
+
+# The QML side reads this file for `status`; stdout is only for manual runs.
+write_result() {
+  printf '%s\n' "$1" >"$RESULT_FILE.tmp.$$" 2>/dev/null \
+    && mv -f "$RESULT_FILE.tmp.$$" "$RESULT_FILE" 2>/dev/null
+}
+
+emit_result() {
+  local json=$1
+  write_result "$json"
+  # The detached startup run has no terminal; a manual run prints the JSON.
+  if [[ -t 1 ]]; then printf '%s\n' "$json"; fi
+  return 0
 }
 
 json_error() {
@@ -58,10 +66,26 @@ json_error() {
 }
 
 fail() {
-  log "error: $*"
-  json_error "$*"
+  local message=$*
+  log "error: $message"
+  emit_result "$(json_error "$message")"
   exit 1
 }
+
+LOCK_FILE=$STATE_DIR/workspace-launcher.lock
+lock_free=1
+if exec 9>"$LOCK_FILE" 2>/dev/null; then
+  if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
+    lock_free=0
+  fi
+fi
+if (( ! lock_free )); then
+  log "another apply is already running; leaving it alone"
+  if ! grep -q '"status":"running"' "$RESULT_FILE" 2>/dev/null; then
+    emit_result '{"status":"busy","reason":"another apply is already running"}'
+  fi
+  exit 0
+fi
 
 command -v hyprctl >/dev/null 2>&1 || fail "hyprctl is not on PATH"
 command -v jq >/dev/null 2>&1 || fail "jq is not on PATH"
@@ -88,7 +112,7 @@ fi
 # A shell restart reloads this service. The marker keeps that from launching a
 # second copy of every app.
 if (( ! FORCE && ! DRY_RUN )) && [[ -f $SESSION_FILE ]] && [[ $(<"$SESSION_FILE") == "$session" ]]; then
-  printf '{"status":"skipped","reason":"already applied for this Hyprland session"}\n'
+  emit_result '{"status":"skipped","reason":"already applied for this Hyprland session"}'
   exit 0
 fi
 
@@ -106,8 +130,15 @@ settle=$(jq -r '.settleSeconds // 25' "$CONFIG" 2>/dev/null)
 [[ $settle =~ ^[0-9]+$ ]] || settle=25
 (( settle >= 2 && settle <= 120 )) || settle=25
 
-monitors=$(hyprctl monitors -j) || fail "could not read monitors"
+monitors=$(hyprctl monitors -j 2>/dev/null) || fail "could not read monitors"
 [[ $(jq 'length' <<<"$monitors") -gt 0 ]] || fail "no monitors connected"
+
+if (( ! DRY_RUN )); then
+  # Mark the session before launching. A plugin reload during shell startup
+  # must not start a second copy of the layout.
+  printf '%s\n' "$session" >"$SESSION_FILE" 2>/dev/null || log "warning: could not write the session marker"
+  emit_result "$(jq -cn --arg session "$session" '{status:"running", session:$session}')"
+fi
 
 rule_names=()
 app_names=()
@@ -320,7 +351,7 @@ while IFS= read -r app; do
   clients=$(hyprctl clients -j 2>/dev/null) || clients='[]'
   if [[ -n $(matching_addresses "$class" "$title" "$clients") ]]; then
     log "$name already has a window; not launching a second copy"
-  elif setsid --fork sh -c "$command" >/dev/null 2>&1 </dev/null; then
+  elif setsid --fork sh -c "$command" 9>&- >/dev/null 2>&1 </dev/null; then
     launched_count=$((launched_count + 1))
     log "launched $name -> $label"
   else
@@ -333,10 +364,6 @@ if (( DRY_RUN )); then
     '{status:"dry-run", plan:$plan, skipped:$skipped}'
   exit 0
 fi
-
-# Record the session before the settle loop: a shell reload during a slow app
-# start must not launch everything a second time.
-printf '%s\n' "$session" >"$SESSION_FILE" 2>/dev/null || log "warning: could not write the session marker"
 
 # Give newly launched apps time to map their windows, moving each as it
 # appears. Stop early once every app has a window and nothing new has arrived
@@ -421,16 +448,17 @@ for i in "${!target_ws[@]}"; do
 done
 
 cleanup_rules
-printf '%s\n' "$session" >"$SESSION_FILE" 2>/dev/null || true
 
 status=ok
 (( missing > 0 )) && status=partial
 
-jq -cn \
+result=$(jq -cn \
   --arg status "$status" \
   --arg session "$session" \
   --argjson launched "$launched_count" \
   --argjson moved "$moved_count" \
   --argjson notFound "$missing" \
   --argjson skipped "$skipped_json" \
-  '{status:$status, session:$session, launched:$launched, moved:$moved, notFound:$notFound, skipped:$skipped}'
+  '{status:$status, session:$session, launched:$launched, moved:$moved, notFound:$notFound, skipped:$skipped}')
+log "finished: $result"
+emit_result "$result"

@@ -113,7 +113,12 @@ omarchy-shell blake.workspace-launcher status
 ## Files
 
 - Log: `~/.local/state/omarchy/workspace-launcher.log`
+- Last result: `~/.local/state/omarchy/workspace-launcher.result`
 - Last applied session: `~/.local/state/omarchy/workspace-launcher.session`
+
+`apply` starts the layout in its own session, so restarting the shell cannot
+interrupt a run that is still placing windows. `status` reads the result file;
+expect `running`, then `ok` or `partial`.
 
 The session marker is what makes the plugin run once per Hyprland session. If
 you want to force a fresh run in the current session, use the `apply` command
