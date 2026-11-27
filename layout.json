@@ -37,6 +37,13 @@
       "class": "^chrome-discord\\.com.*$"
     },
     {
+      "name": "Transmission",
+      "monitor": "DP-1",
+      "workspace": 10,
+      "command": "uwsm-app -- transmission-gtk",
+      "class": "^(com\\.transmissionbt\\.transmission.*|transmission-gtk)$"
+    },
+    {
       "name": "Ghostty",
       "workspace": "scratchpad",
       "command": "uwsm-app -- ghostty",

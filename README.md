@@ -28,6 +28,7 @@ pinned to that workspace.
 | Google Messages | DP-1 workspace 4 |
 | WhatsApp | DP-1 workspace 4, beside Messages |
 | Discord | DP-1 workspace 5 |
+| Transmission | DP-1 workspace 0 (slot 10) |
 | Ghostty | scratchpad (hidden until `Super + S`) |
 | Files | DP-2 workspace 1 |
 | Notion | DP-2 workspace 5 |
